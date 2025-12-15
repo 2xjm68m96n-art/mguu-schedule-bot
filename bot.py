@@ -1,435 +1,209 @@
 import os
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 
-
 TZ = ZoneInfo("Europe/Moscow")
 
-# Твоя группа (из ссылки)
-GROUP_ID = "000000213"
-GROUP_NAME = "23ГМУ-УГЛ11.2"
-BASE_URL = "https://portal.mguu.ru/student/scheduler1.php"
+BASE_SCHEDULE_URL = "https://portal.mguu.ru/student/scheduler1.php?groupid=000000213&groupname=23%D0%93%D0%9C%D0%A3-%D0%A3%D0%93%D0%A511.2&startDate=16.12.2025&endDate=31.01.2026#schedule"
 
 
-@dataclass
-class Lesson:
-    day: date
-    pair: str
-    time: str
-    subject: str
-    teacher: str
-    room: str
-    lesson_type: str
-
-
-# ---------- Markdown helpers ----------
-
-def md_escape(s: str) -> str:
-    """Экранируем символы, которые могут ломать Telegram Markdown."""
-    if not s:
-        return ""
-    s = s.replace("\\", "\\\\")
-    s = s.replace("*", "\\*")
-    s = s.replace("_", "\\_")
-    s = s.replace("`", "\\`")
-    s = s.replace("[", "\\[")
-    s = s.replace("]", "\\]")
-    return s
-
-
-def pair_badge(pair_num: str) -> str:
-    m = {
-        "1": "1️⃣",
-        "2": "2️⃣",
-        "3": "3️⃣",
-        "4": "4️⃣",
-        "5": "5️⃣",
-        "6": "6️⃣",
-        "7": "7️⃣",
-        "8": "8️⃣",
-        "9": "9️⃣",
-        "10": "🔟",
-    }
-    p = (pair_num or "").strip()
-    return m.get(p, f"{p})" if p else "•")
-
-
-def type_badge(lesson_type: str) -> str:
-    t = (lesson_type or "").strip().lower()
-    if not t:
-        return "📌 Занятие"
-    if "практ" in t:
-        return "📘 Практика"
-    if "лекц" in t:
-        return "🎓 Лекция"
-    if "семин" in t:
-        return "🗣 Семинар"
-    if "лаб" in t:
-        return "🧪 Лаба"
-    if "зач" in t or "экзам" in t:
-        return "📝 Контроль"
-    return f"📌 {md_escape(lesson_type.strip())}"
-
-
-# ---------- Schedule fetch + parse ----------
-
-DATE_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
-PAIR_RE = re.compile(r"№\s*пары\s*[-–]\s*(\d+)", re.IGNORECASE)
-TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})")
-
-
-def fetch_html(start: date, end: date) -> str:
-    params = {
-        "groupid": GROUP_ID,
-        "groupname": GROUP_NAME,
-        "startDate": start.strftime("%d.%m.%Y"),
-        "endDate": end.strftime("%d.%m.%Y"),
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; mguu-schedule-bot/1.0)",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    }
-    r = requests.get(BASE_URL, params=params, headers=headers, timeout=30)
+def tg_call(method: str, token: str, payload: dict) -> dict:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
-    return r.text
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error {method}: {data}")
+    return data["result"]
 
 
-def parse_date(s: str) -> Optional[date]:
-    m = DATE_RE.search(s or "")
-    if not m:
-        return None
-    dd, mm, yy = m.group(1), m.group(2), m.group(3)
-    try:
-        return date(int(yy), int(mm), int(dd))
-    except ValueError:
-        return None
+def build_schedule_url() -> str:
+    today = datetime.now(TZ).date()
+    end = today + timedelta(days=45)
+
+    start_str = today.strftime("%d.%m.%Y")
+    end_str = end.strftime("%d.%m.%Y")
+
+    u = urlparse(BASE_SCHEDULE_URL)
+    q = parse_qs(u.query)
+
+    q["startDate"] = [start_str]
+    q["endDate"] = [end_str]
+
+    new_query = urlencode(q, doseq=True)
+    new_u = u._replace(query=new_query)
+    return urlunparse(new_u)
 
 
-def clean_lines(text: str) -> List[str]:
-    lines = []
-    for raw in (text or "").splitlines():
-        t = " ".join(raw.strip().split())
-        if t:
-            lines.append(t)
-    return lines
-
-
-def extract_lesson_from_block(block_text: str, current_day: date) -> Optional[Lesson]:
-    lines = clean_lines(block_text)
-    if not lines:
-        return None
-
-    pair = ""
-    time_s = ""
-    subject = ""
-    teacher = ""
-    room = ""
-    ltype = ""
-
-    for ln in lines:
-        pm = PAIR_RE.search(ln)
-        if pm:
-            pair = pm.group(1).strip()
-        tm = TIME_RE.search(ln)
-        if tm:
-            time_s = f"{tm.group(1)}–{tm.group(2)}"
-
-    # Пробуем распознать поля по смыслу
-    for ln in lines:
-        low = ln.lower()
-
-        if PAIR_RE.search(ln) or TIME_RE.search(ln):
-            continue
-
-        # аудитория
-        if low.startswith("ауд") or "ауд." in low:
-            v = ln.split(".", 1)[-1].strip() if "." in ln else ln
-            room = v if v else ln
-            continue
-
-        # тип занятия
-        if any(x in low for x in ["практич", "лекци", "семинар", "лаборатор", "зачет", "зачёт", "экзам"]):
-            # иногда строка "Тип: ..." — тоже сюда попадёт, это ок
-            if ":" in ln and low.startswith("тип"):
-                ltype = ln.split(":", 1)[-1].strip()
-            else:
-                ltype = ln
-            continue
-
-        # преподаватель
-        if teacher == "" and (low.startswith("преп") or "преп" in low):
-            teacher = ln.split(":", 1)[-1].strip() if ":" in ln else ln
-            continue
-
-        # если похоже на ФИО — тоже считаем преподавателем
-        if teacher == "" and len(ln.split()) >= 2 and any(suf in low for suf in ["вна", "овна", "евна", "ич", "вич"]):
-            teacher = ln
-            continue
-
-        # предмет
-        if subject == "":
-            subject = ln
-
-    # добираем room из "Ауд. 318В" если не поймали
-    if not room:
-        for ln in lines:
-            if "ауд" in ln.lower() and any(ch.isdigit() for ch in ln):
-                room = ln
-                break
-
-    # чистим "Тип:" если он так пришёл
-    if ltype.lower().startswith("тип"):
-        ltype = ltype.split(":", 1)[-1].strip() if ":" in ltype else ltype
-
-    if not subject and not teacher and not room and not ltype:
-        return None
-
-    return Lesson(
-        day=current_day,
-        pair=pair,
-        time=time_s,
-        subject=subject,
-        teacher=teacher,
-        room=room,
-        lesson_type=ltype,
+def fetch_page_text(url: str) -> str:
+    r = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SchedulePinnedBot/1.0)"},
+        timeout=30,
     )
+    r.raise_for_status()
+    if not r.encoding:
+        r.encoding = r.apparent_encoding or "utf-8"
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    return soup.get_text("\n", strip=True)
 
 
-def parse_schedule(html: str) -> Dict[date, List[Lesson]]:
-    soup = BeautifulSoup(html, "html.parser")
+def parse_schedule(text: str) -> dict[date, list[dict]]:
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-    # Находим даты в документе
-    date_nodes: List[Tuple[date, object]] = []
-    for text_node in soup.find_all(string=DATE_RE):
-        d = parse_date(str(text_node))
-        if not d:
+    date_re = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    pair_re = re.compile(r"^№\s*пары\s*-\s*(\d+)\s*$")
+    time_re = re.compile(r"^\d{2}:\d{2}\s*-\s*\d{2}:\d{2}$")
+
+    def clean(s: str) -> str:
+        s = s.strip()
+        if s.startswith("|"):
+            s = s[1:].strip()
+        return s
+
+    out: dict[date, list[dict]] = {}
+    cur_date: date | None = None
+    i = 0
+
+    while i < len(lines):
+        ln = lines[i]
+
+        if date_re.match(ln):
+            dd, mm, yyyy = ln.split(".")
+            cur_date = date(int(yyyy), int(mm), int(dd))
+            out.setdefault(cur_date, [])
+            i += 1
             continue
-        parent = getattr(text_node, "parent", None)
-        if parent is None:
+
+        m = pair_re.match(ln)
+        if cur_date and m:
+            pair_num = m.group(1)
+
+            time_str = ""
+            j = i + 1
+            if j < len(lines) and time_re.match(lines[j]):
+                time_str = lines[j].replace(" - ", "–")
+                j += 1
+
+            payload = []
+            while j < len(lines):
+                if date_re.match(lines[j]) or pair_re.match(lines[j]):
+                    break
+                payload.append(clean(lines[j]))
+                if len(payload) >= 6:
+                    break
+                j += 1
+
+            payload = [p for p in payload if p]
+            subject = payload[0] if len(payload) > 0 else ""
+            teacher = payload[1] if len(payload) > 1 else ""
+            room = payload[2] if len(payload) > 2 else ""
+            ltype = payload[3] if len(payload) > 3 else ""
+
+            out[cur_date].append(
+                {
+                    "pair": pair_num,
+                    "time": time_str,
+                    "subject": subject,
+                    "teacher": teacher,
+                    "room": room,
+                    "type": ltype,
+                }
+            )
+
+            i = j
             continue
-        date_nodes.append((d, parent))
 
-    # Убираем дубли дат
-    seen = set()
-    uniq: List[Tuple[date, object]] = []
-    for d, node in date_nodes:
-        if d in seen:
-            continue
-        seen.add(d)
-        uniq.append((d, node))
+        i += 1
 
-    schedule: Dict[date, List[Lesson]] = {}
-    if not uniq:
-        return schedule
-
-    for idx, (d, node) in enumerate(uniq):
-        next_node = uniq[idx + 1][1] if idx + 1 < len(uniq) else None
-
-        blocks: List[str] = []
-        cur = node
-        while True:
-            cur = cur.find_next() if cur else None
-            if cur is None:
-                break
-            if next_node is not None and cur == next_node:
-                break
-
-            try:
-                t = cur.get_text("\n", strip=True)
-            except Exception:
-                continue
-
-            if "№ пары" in t or "№пары" in t:
-                blocks.append(t)
-
-        lessons: List[Lesson] = []
-        for b in blocks:
-            lesson = extract_lesson_from_block(b, d)
-            if lesson:
-                lessons.append(lesson)
-
-        # сортируем по номеру пары
-        def k(x: Lesson):
-            try:
-                return int(x.pair)
-            except Exception:
-                return 999
-
-        lessons.sort(key=k)
-        schedule[d] = lessons
-
-    return schedule
+    out = {d: lessons for d, lessons in out.items() if lessons}
+    return out
 
 
-# ---------- Message formatting ----------
-
-def format_message(schedule: Dict[date, List[Lesson]]) -> str:
+def format_message(schedule: dict[date, list[dict]]) -> str:
     now = datetime.now(TZ)
     today = now.date()
     tomorrow = today + timedelta(days=1)
     after_tomorrow = today + timedelta(days=2)
 
-    SEP = "━━━━━━━━━━━━━━"
-
-    def day_title(d: date, title: str) -> str:
-        return f"🗓 **{title} · {d.strftime('%d.%m.%Y')}**"
-
-    def format_day(d: date, title: str) -> List[str]:
+    def format_day(d: date, title: str) -> list[str]:
         lessons = schedule.get(d, [])
-        out = [day_title(d, title)]
+        block = [f"🗓 {title} ({d.strftime('%d.%m.%Y')})", ""]
         if not lessons:
-            out.append("— пар нет —")
-            return out
+            block.append("— пар нет —")
+            block.append("")
+            return block
 
         for l in lessons:
-            b = pair_badge(l.pair)
-            time_s = md_escape((l.time or "").strip())
-            subj = md_escape((l.subject or "").strip())
-            teacher = md_escape((l.teacher or "").strip())
-            room = md_escape((l.room or "").strip())
+            line1 = f"{l['pair']}) {l['time']}".strip()
+            block.append(line1)
 
-            out.append("")
-            out.append(f"**{b} {time_s}**")
-            if subj:
-                out.append(f"📚 {subj}")
-            if teacher:
-                out.append(f"👤 {teacher}")
-            if room:
-                out.append(f"📍 {room}")
-            out.append(type_badge(l.lesson_type))
+            if l["subject"]:
+                block.append(l["subject"])
+            if l["teacher"]:
+                block.append(f"Преп.: {l['teacher']}")
+            if l["room"]:
+                block.append(f"{l['room']}")
+            if l["type"]:
+                block.append(f"Тип: {l['type']}")
+            block.append("")
+        return block
 
-        return out
-
-    parts: List[str] = []
+    parts = []
     parts += format_day(today, "Сегодня")
-    parts.append("")
-    parts.append(SEP)
-    parts.append("")
     parts += format_day(tomorrow, "Завтра")
-    parts.append("")
-    parts.append(SEP)
-    parts.append("")
     parts += format_day(after_tomorrow, "Послезавтра")
-    parts.append("")
-    parts.append(f"🔄 _Обновлено: {now.strftime('%H:%M')} (МСК)_")
+    parts.append(f"🔄 Обновлено: {now.strftime('%H:%M')} (МСК)")
     parts.append("Источник: portal.mguu.ru")
 
     msg = "\n".join(parts).strip()
     return msg[:4096]
 
 
-# ---------- Telegram API ----------
-
-def tg_api(token: str, method: str, payload: dict) -> dict:
-    url = f"https://api.telegram.org/bot{token}/{method}"
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data
-
-
-def get_bot_id(token: str) -> int:
-    me = tg_api(token, "getMe", {})
-    return int(me["result"]["id"])
-
-
-def get_pinned_message_id_if_ours(token: str, chat_id: str, bot_id: int) -> Optional[int]:
-    """
-    Возвращает message_id закрепа, если:
-    - закреп есть
-    - закреплённое сообщение отправлено этим ботом
-    Иначе None.
-    """
-    chat = tg_api(token, "getChat", {"chat_id": chat_id})
-    pinned = chat["result"].get("pinned_message")
-    if not pinned:
-        return None
-
-    from_obj = pinned.get("from") or {}
-    from_id = from_obj.get("id")
-    if from_id is None:
-        return None
-
-    if int(from_id) != int(bot_id):
-        return None
-
-    mid = pinned.get("message_id")
-    return int(mid) if mid is not None else None
-
-
-# ---------- Main ----------
-
-def main() -> None:
+def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     chat_id = os.environ.get("CHAT_ID", "").strip()
 
     if not token or not chat_id:
-        raise SystemExit("ENV BOT_TOKEN and CHAT_ID are required")
+        raise SystemExit("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения.")
 
-    # 1) Даты “скользящие”
-    start = datetime.now(TZ).date()
-    end = start + timedelta(days=45)
+    url = build_schedule_url()
+    page_text = fetch_page_text(url)
+    schedule = parse_schedule(page_text)
+    message_text = format_message(schedule)
 
-    # 2) Парсим сайт
-    html = fetch_html(start, end)
-    schedule = parse_schedule(html)
+    me = tg_call("getMe", token, {})
+    bot_id = me["id"]
 
-    # 3) Формируем красивый Markdown
-    text = format_message(schedule)
+    chat = tg_call("getChat", token, {"chat_id": chat_id})
+    pinned = chat.get("pinned_message")
 
-    # 4) Получаем id бота и проверяем закреп
-    bot_id = get_bot_id(token)
-    pinned_id = get_pinned_message_id_if_ours(token, chat_id, bot_id)
-
-    if pinned_id:
-        # редактируем существующий закреп (наш)
-        tg_api(
-            token,
+    if pinned and pinned.get("from", {}).get("id") == bot_id:
+        msg_id = pinned["message_id"]
+        tg_call(
             "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": pinned_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
+            token,
+            {"chat_id": chat_id, "message_id": msg_id, "text": message_text, "disable_web_page_preview": True},
         )
         return
 
-    # 5) Если закрепа нет или он не наш — отправляем новое и закрепляем
-    sent = tg_api(
-        token,
+    sent = tg_call(
         "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        },
+        token,
+        {"chat_id": chat_id, "text": message_text, "disable_web_page_preview": True},
     )
-    new_id = int(sent["result"]["message_id"])
-
-    # закрепляем (если нет прав, просто не упадём)
-    try:
-        tg_api(
-            token,
-            "pinChatMessage",
-            {
-                "chat_id": chat_id,
-                "message_id": new_id,
-                "disable_notification": True,
-            },
-        )
-    except Exception:
-        pass
+    msg_id = sent["message_id"]
+    tg_call(
+        "pinChatMessage",
+        token,
+        {"chat_id": chat_id, "message_id": msg_id, "disable_notification": True},
+    )
 
 
 if __name__ == "__main__":
