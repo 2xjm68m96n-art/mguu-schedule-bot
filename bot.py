@@ -169,7 +169,9 @@ def format_message(schedule: dict[date, list[dict]]) -> str:
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     chat_id = os.environ.get("CHAT_ID", "").strip()
-print("DEBUG CHAT_ID =", chat_id)
+
+    # DEBUG: покажем в логах, какой chat_id реально взялся из Secrets
+    print("DEBUG CHAT_ID =", chat_id)
 
     if not token or not chat_id:
         raise SystemExit("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения.")
@@ -190,7 +192,12 @@ print("DEBUG CHAT_ID =", chat_id)
         tg_call(
             "editMessageText",
             token,
-            {"chat_id": chat_id, "message_id": msg_id, "text": message_text, "disable_web_page_preview": True},
+            {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": message_text,
+                "disable_web_page_preview": True,
+            },
         )
         print("DEBUG edited pinned message_id =", msg_id)
         return
@@ -200,7 +207,8 @@ print("DEBUG CHAT_ID =", chat_id)
         token,
         {"chat_id": chat_id, "text": message_text, "disable_web_page_preview": True},
     )
-print("DEBUG sendMessage result message_id =", sent.get("message_id"))
+    print("DEBUG sendMessage result message_id =", sent.get("message_id"))
+
     msg_id = sent["message_id"]
     tg_call(
         "pinChatMessage",
