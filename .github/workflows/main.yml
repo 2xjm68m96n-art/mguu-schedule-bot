@@ -3,7 +3,7 @@ name: Schedule bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # каждый час (UTC)
+    - cron: "0 * * * *"
 
 jobs:
   run:
@@ -24,4 +24,5 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          KT_STUDENT_ID: ${{ secrets.KT_STUDENT_ID }}
         run: python bot.py
