@@ -1,0 +1,13 @@
+name: Timer test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  timer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current time
+        run: date -u
