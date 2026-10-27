@@ -3,7 +3,7 @@ name: Schedule bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "17 * * * *"
 
 jobs:
   run:
