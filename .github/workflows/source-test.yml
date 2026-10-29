@@ -1,0 +1,66 @@
+name: New source test
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check schedule and control points
+        env:
+          KT_STUDENT_ID: ${{ secrets.KT_STUDENT_ID }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urlencode
+          from urllib.request import urlopen
+          from zoneinfo import ZoneInfo
+
+          base = "https://schedule.mguu.ru/api/v1"
+
+          def get(path, params):
+              try:
+                  with urlopen(base + path + "?" + urlencode(params), timeout=45) as response:
+                      data = json.loads(response.read())
+              except HTTPError as error:
+                  raise SystemExit(f"SOURCE HTTP ERROR: {error.code}") from None
+              except (URLError, TimeoutError, ValueError):
+                  raise SystemExit("SOURCE CONNECTION OR JSON ERROR") from None
+              if not isinstance(data, dict):
+                  raise SystemExit("UNEXPECTED RESPONSE TYPE")
+              return data
+
+          today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+          schedule = get("/schedule/groups/000000213/lessons/", {
+              "start_date": today.strftime("%d.%m.%Y"),
+              "end_date": (today + timedelta(days=3)).strftime("%d.%m.%Y"),
+          })
+          assert isinstance(schedule.get("days"), list), "NO SCHEDULE DAYS"
+          print("SCHEDULE OK, days:", len(schedule["days"]), flush=True)
+
+          student = os.environ.get("KT_STUDENT_ID", "").strip()
+          assert student, "KT_STUDENT_ID SECRET IS MISSING"
+          student = quote(student, safe="")
+          period = {"year": "000000033", "sem": 0}
+          rating = get(f"/rating/students/{student}/", period)
+          assert rating.get("student_number") == "УГХ-2340о", "STUDENT DOES NOT MATCH"
+          assert isinstance(rating.get("disciplines"), list), "NO SUBJECT LIST"
+          print("OWN SUBJECT LIST OK", flush=True)
+
+          row = next(x for x in rating["disciplines"] if x["discipline_code"] == "000003376")
+          points = get(f"/rating/students/{student}/disciplines/000003376/", {
+              **period, "control": row["control_code"],
+          })
+          assert isinstance(points.get("checkpoints"), list), "NO CHECKPOINT LIST"
+          for point in points["checkpoints"]:
+              assert "number" in point and "date" in point, "CHECKPOINT FORMAT CHANGED"
+          print("CONTROL POINTS OK, count:", len(points["checkpoints"]), flush=True)
+          print("ALL SOURCE CHECKS PASSED. TELEGRAM WAS NOT CHANGED.")
+          PY
